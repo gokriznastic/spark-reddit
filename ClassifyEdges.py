@@ -40,27 +40,46 @@ def print_confusion_matrix(predictions):
     metrics = MulticlassMetrics(predictionAndLabels)
     # Print the confusion matrix
     print("Confusion Matrix:\n", metrics.confusionMatrix().toArray())
-    
 
-def getData(datafolder, spark):
+
+def printDatasetStats(df):
     """
-    authors: Laura Rojas
-    summary:
+    authors: Gopal Krishna
+    summary: Print basic statistics about the dataset.
+    """
+    print("Dataset Statistics:")
+    print(f"Number of Rows: {df.count()}")
+    print(f"Number of Columns: {len(df.columns)}")
+    print("Column Names: ", df.columns)
+    df.describe().show()
+
+
+def getData(datafolder, spark, pct=1.0):
+    """
+    authors: Laura Rojas, Gopal Krishna
+    summary: Read dataset from given datafolder and calculate its statistics.
     """
     # Declare "user defined functions"
     floatArray = udf(lambda x: parseParams(x), ArrayType(DoubleType()) )
     intCast = udf(lambda x: int(x), IntegerType() )
-    
+
     # First, pull graph data from "data" folder (will take ALL FILES in the folder)
     df = spark.read.options(header='True',delimiter='\t').csv(datafolder)
-    
+
+    # Sample the data if pct is less than 1.0
+    if pct < 1.0:
+        df = df.sample(withReplacement=False, fraction=pct, seed=42)
+
     # Apply user-defined functions
     df = df.withColumn("LINK_SENTIMENT", intCast(col("LINK_SENTIMENT")))
     df = df.withColumn("PROPERTIES", floatArray(col("PROPERTIES")))
-    
+
     # Make link sentiment nonnegative
     df = df.withColumn("LINK_SENTIMENT", when(col("LINK_SENTIMENT") == -1, 0).otherwise(1))
-    
+
+    # Print dataset statistics
+    printDatasetStats(df)
+
     # Return dataframe
     return df
 
@@ -68,7 +87,7 @@ def getData(datafolder, spark):
 def parseParams(s):
     """
     authors: Laura Rojas
-    summary: This function parses the parameters in "comma separated string" format 
+    summary: This function parses the parameters in "comma separated string" format
     """
     v = s.split(",")
     x = [0]*len(v)
@@ -118,26 +137,30 @@ def getNormalized(train, test):
     newtest.cache()
     train.unpersist()
     test.unpersist()
-    
+
     # Return new train and test
     return newtrain, newtest
-    
+
 def initTime(args):
     """
-    authors: Laura Rojas
+    authors: Laura Rojas, Gopal Krishna
     summary: A function that initializes the start time and begins storing information in the "time output file".
     """
     # Obtain start time
     start = time()
-    # Define "save string" 
-    savestr = "\nStoring time data for the following parameters: --master " + str(args.master) + " --N " + str(args.N) + " --regParam " + str(args.regParam) + " --elasticParam " + str(args.elasticParam)
-    # Initialize time data
+    # Define "save string"
+    savestr = "\nStoring time data for the following parameters: --master " + str(args.master) + \
+            " --N " + str(args.N) + \
+            " --regParam " + str(args.regParam) + \
+            " --elasticParam " + str(args.elasticParam) + \
+            " --pct " + str(args.pct)
+        # Initialize time data
     file = open('./logs/time.txt','a')
     file.write(savestr)
     file.close()
     # Return start time
     return start
-    
+
 def getTime(start,savestr):
     """
     authors: Laura Rojas
@@ -250,7 +273,7 @@ def saveData(lr, predictions, args):
     lr.save(model_path)
     # Print info
     print("Model saved to "+str(model_path))
-    
+
     # Save the predictions
     if os.path.exists(predictions_path):
         shutil.rmtree(predictions_path)
@@ -258,10 +281,10 @@ def saveData(lr, predictions, args):
     predictions.write.format("parquet").save(predictions_path)
     # Print info
     print("Predictions saved to "+str(predictions_path))
-    
+
     # Unpersist the predictions rdd after saving
     predictions.unpersist()
-    
+
     # Empty return, all data saved
     return
 
@@ -275,6 +298,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description = 'Graph Edge Classification using Parallel Logistic Regression.',formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('--master',default="local[*]",help="Spark Master")
     parser.add_argument('--datafolder', default='data', help='Folder where the data is pulled from when training')
+    parser.add_argument('--pct', type=float, default=1.0, help='Percentage of dataset to sample')
     parser.add_argument('--regParam', type=float, default=0.1, help='Regularization parameter for LR when training')
     parser.add_argument('--elasticParam', type=float, default=0.8, help='Elastic Net parameter for LR ')
     parser.add_argument('--N', type=int, default=10000000, help='Number of iterations for LR ')
@@ -302,7 +326,7 @@ if __name__ == "__main__":
     ###
     
     # Obtain raw data 
-    rawdata = getData(args.datafolder, spark)
+    rawdata = getData(args.datafolder, spark, args.pct)
     print("Raw data obtained from "+ str(args.datafolder))
     
     # From the raw data, obtain vectorized 
