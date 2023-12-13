@@ -7,7 +7,7 @@ import numpy as np
 import argparse
 # Import operating system utilities
 import sys
-import os 
+import os
 import shutil
 from time import time
 # Import Spark libraries
@@ -18,14 +18,14 @@ from pyspark.sql import SparkSession
 from pyspark.sql.types import *
 from pyspark.sql.functions import udf, col, split, when
 # Import Spark MLlib libraries
-from pyspark.ml.classification import LogisticRegression
+from pyspark.ml.classification import LogisticRegression, RandomForestClassifier
 from pyspark.mllib.evaluation import MulticlassMetrics
 from pyspark.ml.evaluation import  BinaryClassificationEvaluator
 from pyspark.ml.evaluation import MulticlassClassificationEvaluator
 from pyspark.ml.feature import MinMaxScaler
 from pyspark.ml.linalg import Vectors
 from pyspark.ml.feature import VectorAssembler
-# Import python debugger
+from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
 import pdb
 
 
@@ -109,13 +109,13 @@ def getVectorized(data, split):
     assembler = VectorAssembler(inputCols=property_columns, outputCol="FEATURES")
     vectorized = assembler.transform(select_properties)
     vectorized = vectorized.select(['POST_ID','LINK_SENTIMENT','FEATURES'])
-    
+
     # Apply train-test split and return
     train, test = vectorized.randomSplit(split, seed = 2018)
     # Cache data (will be used later)
     train.cache()
     test.cache()
-    
+
     # Return vectorized data
     return train, test
 
@@ -131,7 +131,7 @@ def getNormalized(train, test):
     # Scale the train and test data
     newtrain = scalerModel.transform(train)
     newtest = scalerModel.transform(test)
-    
+
     # Cache/unpersist train and test
     newtrain.cache()
     newtest.cache()
@@ -179,48 +179,62 @@ def getTime(start,savestr):
     file.close()
     # Return current time string
     return currenttime
-    
+
+def getClassifier(args):
+    """
+    authors: Gopal Krishna
+    summary: Fucntion to choose classifier according to arguments.
+    """
+    if args.model_type == 'logistic_regression':
+        model = LogisticRegression(featuresCol='FEATURES_NORMALIZED', labelCol='LINK_SENTIMENT', weightCol="classWeight",  maxIter=args.N, regParam=args.regParam, elasticNetParam=args.elasticParam)
+    elif args.model_type == 'random_forest':
+        model = RandomForestClassifier(featuresCol='FEATURES_NORMALIZED', labelCol='LINK_SENTIMENT', numTrees=args.numTrees, maxDepth=args.maxDepth)
+    else:
+        raise ValueError("Invalid model type. Supported types are 'logistic_regression' and 'random_forest'.")
+
+    return model
+
 def trainLoop(train, test, args):
     """
-    authors: Ahmet Demirkaya, Laura Rojas
+    authors: Ahmet Demirkaya, Laura Rojas, Gopal Krishna
     summary: Training loop function that trains the logistic regression regression model.
     """
-    # Initialize balance to true
-    balance = True
-    if balance:
-        # Calculate balance ratio (assuming 0 is the minority class)
-        balance_ratio = train.filter(col("LINK_SENTIMENT") == 1).count() / train.count()
+    # Calculate balance ratio (assuming 0 is the minority class)
+    balance_ratio = train.filter(col("LINK_SENTIMENT") == 1).count() / train.count()
 
-        # Add a weight column to the DataFrame
-        newtrain = train.withColumn("classWeight", when(train["LINK_SENTIMENT"] == 0, balance_ratio).otherwise(1-balance_ratio))
-        # Swap oldtrain with newtrain (because of balance). Manage cache and unpersist. 
-        newtrain.cache()
-        train.unpersist()
-        train = newtrain
+    # Add a weight column to the DataFrame
+    newtrain = train.withColumn("classWeight", when(train["LINK_SENTIMENT"] == 0, balance_ratio).otherwise(1-balance_ratio))
+    # Swap oldtrain with newtrain (because of balance). Manage cache and unpersist. 
+    newtrain.cache()
+    train.unpersist()
+    train = newtrain
 
-        # Now use this weight column in logistic regression
-        lr = LogisticRegression(featuresCol='FEATURES_NORMALIZED', labelCol='LINK_SENTIMENT', weightCol="classWeight",  maxIter=args.N, regParam=args.regParam, elasticNetParam=args.elasticParam)
-    else:
-        # Define "logistic regression" model and fit with train data
-        lr = LogisticRegression(featuresCol = 'FEATURES_NORMALIZED', labelCol = 'LINK_SENTIMENT', maxIter=args.N, regParam=args.regParam, elasticNetParam=args.elasticParam)
-    
+    classifier = getClassifier(args)
+
     # Fit to training data and cache model
-    lr = lr.fit(train)
-    
+    if args.cross_val:
+        # Create a binary classification evaluator
+        evaluator = BinaryClassificationEvaluator(labelCol="LINK_SENTIMENT", metricName="areaUnderROC")
+        params_grid = ParamGridBuilder().build()
+        crossval = CrossValidator(estimator=classifier, estimatorParamMaps=params_grid, evaluator=evaluator, numFolds=args.k, collectSubModels=True)
+
+        # Fit the CrossValidator to the training data
+        cv_model = crossval.fit(train)
+
+        # Get the best model from cross-validation
+        model = cv_model.bestModel
+    else:
+        model = classifier.fit(train)
+
     # Return lr
-    return lr, train
-    
+    return model, train
+
+
 def getMetrics(lr, test):
     """
-    authors: Ahmet Demirkaya, Laura Rojas
+    authors: Ahmet Demirkaya, Laura Rojas, Gopal Krishna
     summary: Function that prints the desired "model result metrics".
     """
-    # Access the summary
-    trainingSummary = lr.summary
-    # Print the objective history (loss at each iteration)
-    print("Objective History: ")
-    print(trainingSummary)
-    
     # Make predictions on test data
     predictions = lr.transform(test)
     # Select example rows to display
@@ -230,12 +244,12 @@ def getMetrics(lr, test):
     # Cache the test and train predictions
     predictions.cache()
     train_predictions.cache()
-    
+
     # Select (prediction, true label) and compute test error
     evaluator = BinaryClassificationEvaluator(labelCol="LINK_SENTIMENT", rawPredictionCol="prediction", metricName="areaUnderROC")
     roc_auc = evaluator.evaluate(predictions)
     print("Test Area Under ROC: " + str(roc_auc))
-    
+
     # Evaluate accuracy on the training dataset
     train_accuracy_evaluator = MulticlassClassificationEvaluator(labelCol="LINK_SENTIMENT", predictionCol="prediction", metricName="accuracy")
     train_accuracy = train_accuracy_evaluator.evaluate(train_predictions)
@@ -244,19 +258,44 @@ def getMetrics(lr, test):
     test_accuracy_evaluator = MulticlassClassificationEvaluator(labelCol="LINK_SENTIMENT", predictionCol="prediction", metricName="accuracy")
     test_accuracy = test_accuracy_evaluator.evaluate(predictions)
     print("Test Accuracy: " + str(test_accuracy))
-    
+
+    # Precision, Recall, True Positive Rate, False Positive Rate
+    tp = predictions.filter("prediction = 1 AND LINK_SENTIMENT = 1").count()
+    fp = predictions.filter("prediction = 1 AND LINK_SENTIMENT = 0").count()
+    tn = predictions.filter("prediction = 0 AND LINK_SENTIMENT = 0").count()
+    fn = predictions.filter("prediction = 0 AND LINK_SENTIMENT = 1").count()
+
+    precision = tp / (tp + fp)
+    recall = tp / (tp + fn)
+    true_positive_rate = tp / (tp + fn)
+    false_positive_rate = fp / (fp + tn)
+
+    print(f"Precision: {precision}")
+    print(f"Recall: {recall}")
+    print(f"True Positive Rate: {true_positive_rate}")
+    print(f"False Positive Rate: {false_positive_rate}")
+
     # Printing confusion matrix for the training set
     print("Training Confusion Matrix:")
     print_confusion_matrix(train_predictions)
     # Printing confusion matrix for the test set
     print("\nTest Confusion Matrix:")
     print_confusion_matrix(predictions)
-    
+
     # Unpersist the train_predictions, no longer needed. Keep test predictions cached (will unpersist in saveData)
     train_predictions.unpersist()
-    
+
     # Return ONLY the predictions (needed to save)
     return predictions
+
+def print_confusion_matrix(predictions):
+    """
+    authors: Gopal Krishna
+    summary: Print the confusion matrix for the given DataFrame of predictions.
+    """
+    confusion_matrix = predictions.crosstab("LINK_SENTIMENT", "prediction")
+    confusion_matrix.show()
+
 
 def saveData(lr, predictions, args):
     """
@@ -299,84 +338,89 @@ if __name__ == "__main__":
     parser.add_argument('--master',default="local[*]",help="Spark Master")
     parser.add_argument('--datafolder', default='data', help='Folder where the data is pulled from when training')
     parser.add_argument('--pct', type=float, default=1.0, help='Percentage of dataset to sample')
-    parser.add_argument('--regParam', type=float, default=0.1, help='Regularization parameter for LR when training')
+    parser.add_argument('--model_type', type=str, default="logistic_regression", help='The classifier to use- "logitic_regression" or "random_forest"')
+    parser.add_argument('--loglevel', type=str, default="ERROR", help='Spark log level. Default is ERROR only')
+    parser.add_argument('--cross_val', type=bool, default=False, help='Cross-validation to be used for selecting model or not.')
+    parser.add_argument('--k', type=int, default="4", help='Number of folds for cross-validating')
+    parser.add_argument('--regParam', type=float, default=0.0, help='Regularization parameter for LR when training')
     parser.add_argument('--elasticParam', type=float, default=0.8, help='Elastic Net parameter for LR ')
     parser.add_argument('--N', type=int, default=10000000, help='Number of iterations for LR ')
-    parser.add_argument('--loglevel', type=str, default="ERROR", help='Spark log level. Default is ERROR only')
+    parser.add_argument('--maxDepth', type=int, default=5, help='Max depth parameter for RF ')
+    parser.add_argument('--numTrees', type=int, default=20, help='Number of trees parameter for RF ')
+
     # Define args
     parser.set_defaults(verbose=False)
     args = parser.parse_args()
-    
+
     ###
     # INITIALIZATION
     ###
-    
+
     # Define spark context. Declare log level. Default master is "run locally with as many threads as # of processors available locally"
     sc = SparkContext(args.master, 'Graph Edge Classification using Parallel Logistic Regression')
     sc.setLogLevel(args.loglevel)
     print("\nSetting LogLevel to "+ str(args.loglevel))
     # Define sparksession (default master is "run locally with as many threads as # of processors available locally"
-    spark = SparkSession.builder.appName("DataFrame").getOrCreate() 
-    
+    spark = SparkSession.builder.appName("DataFrame").getOrCreate()
+
     # Initialize start time
     start = initTime(args)
-    
+
     ###
     # PREPROCESSING
     ###
-    
-    # Obtain raw data 
+
+    # Obtain raw data
     rawdata = getData(args.datafolder, spark, args.pct)
     print("Raw data obtained from "+ str(args.datafolder))
-    
-    # From the raw data, obtain vectorized 
+
+    # From the raw data, obtain vectorized
     train, test = getVectorized(rawdata,[0.7, 0.3])
     print("Data vectorized. Train/Test split complete: [0.7, 0.3]")
-    
+
     # From the vectorized data, obtain normalized. Note: train and test will be CACHED
     train, test = getNormalized(train, test)
     print("Data normalized according to training data.")
     # Print preprocess time
     print("Preprocessing time:", getTime(start,"    preprocessing time: "))
     preprocess_time = time()
-    
+
     ###
     # TRAINING
     ###
-    
+
     # Training loop
     print("\nBegin training.")
-    lr, train = trainLoop(train, test, args)
+    model, train = trainLoop(train, test, args)
     print("Training done.\nTraining time:", getTime(preprocess_time,"    training time: "))
-    
+
     ###
     # RESULTS / METRICS
     ###
-    
+
     # Redirect to OUTPUT log file
     print("\nGenerating metrics. Saving data to output log.")
     # Write to log
     original = sys.stdout
     sys.stdout = open('./logs/output.txt','wt')
     # Get metrics (empty return, all data saved to output log file"
-    predictions = getMetrics(lr, test)
-    
+    predictions = getMetrics(model, test)
+
     # Unpersist train and test (will no longer be used)
     train.unpersist()
     test.unpersist()
-    
+
     ###
     # SAVING RESULTS
     ###
-    
+
     # Redirect from output log file to original (console) output
     print("\nMetrics saved. Saving model and predictions.")
     # Return to console output
     sys.stdout = original
-    
+
     # Save model and predictions using saveData
-    saveData(lr, predictions, args)
-    
+    # saveData(model, predictions, args)
+
     # Print total execution time
     print("\nTotal execution time:", getTime(start,"    total execution time: "))
-    
